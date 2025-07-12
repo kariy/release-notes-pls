@@ -4,6 +4,27 @@ import sys
 from github import Auth, Github
 import anthropic
 
+def generate_prompt(formatted_changes):
+	prompt = f"""
+	You are an expert technical writer for a software project. Your task is to generate clear, concise, and user-friendly release notes based on the following list of changes (Pull Request descriptions and commit messages).
+
+	Here are the changes: {formatted_changes}
+
+	Generate the notes in this exact format in Markdown:
+
+	```
+	## <CHANGE CATEGORY>
+
+	* <CHANGE_SUMMARY> (<PR_NUMBER>)
+	```
+
+	Valid change categories are: fixes, improvements
+
+	If there are multiple PRs associated with a change, list the PR using the format `(<PR_NUMBER>)` side by side.
+	"""
+
+	return prompt
+
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(description="Generate AI-powered release notes.")
 	parser.add_argument("--base", required=True, help="Base tag.")
@@ -61,26 +82,9 @@ if __name__ == "__main__":
 			)
 			formatted_changes += "\n"
 
+	prompt = generate_prompt(formatted_changes)
+
 	client = anthropic.Anthropic(api_key=api_key)
-
-	prompt = f"""
-	You are an expert technical writer for a software project. Your task is to generate clear, concise, and user-friendly release notes based on the following list of changes (Pull Request descriptions and commit messages).
-
-	Here are the changes: {formatted_changes}
-
-	Generate the notes in this exact format in Markdown:
-
-	```
-	## <CHANGE CATEGORY>
-
-	* <CHANGE_SUMMARY> (<PR_NUMBER>)
-	```
-
-	Valid change categories are: fixes, improvements
-
-	If there are multiple PRs associated with a change, list the PR using the format `(<PR_NUMBER>)` side by side.
-	"""
-
 	message = client.messages.create(
 		model="claude-4-sonnet-20250514",
 		max_tokens=1024,
