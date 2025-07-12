@@ -1,0 +1,150 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag name for release"
+        required: true
+
+jobs:
+  build:
+    name: Build Binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: release-notes-pls-linux-amd64
+            binary_name: release-notes-pls
+          - os: macos-latest
+            artifact_name: release-notes-pls-darwin-amd64
+            binary_name: release-notes-pls
+          - os: macos-13
+            artifact_name: release-notes-pls-darwin-arm64
+            binary_name: release-notes-pls
+          - os: windows-latest
+            artifact_name: release-notes-pls-windows-amd64
+            binary_name: release-notes-pls.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Build binary with PyInstaller
+        run: uv run pyinstaller release-notes-pls.spec
+
+      - name: Test binary
+        run: ./dist/${{ matrix.binary_name }} --help
+
+      - name: Rename binary for release
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            mv dist/${{ matrix.binary_name }} dist/${{ matrix.artifact_name }}.exe
+          else
+            mv dist/${{ matrix.binary_name }} dist/${{ matrix.artifact_name }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}*
+
+  release:
+    name: Create draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat << EOF > release_notes.md
+          ## Release ${{ steps.get_version.outputs.VERSION }}
+
+          ### Installation
+
+          Download the appropriate binary for your platform:
+
+          - **Linux (x86_64)**: \`release-notes-pls-linux-amd64\`
+          - **macOS (Intel)**: \`release-notes-pls-darwin-amd64\`
+          - **macOS (Apple Silicon)**: \`release-notes-pls-darwin-arm64\`
+          - **Windows**: \`release-notes-pls-windows-amd64.exe\`
+
+          Make the binary executable (Linux/macOS):
+          \`\`\`bash
+          chmod +x release-notes-pls-*
+          \`\`\`
+
+          ### Usage
+
+          Set the required environment variables:
+          \`\`\`bash
+          export GITHUB_TOKEN="your-github-token"
+          export API_KEY="your-anthropic-api-key"
+          \`\`\`
+
+          Generate release notes:
+          \`\`\`bash
+          ./release-notes-pls --base v1.0.0 --head v1.1.0 owner/repo
+          \`\`\`
+
+          For more options:
+          \`\`\`bash
+          ./release-notes-pls --help
+          \`\`\`
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG_NAME }}
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          body_path: release_notes.md
+          draft: true
+          prerelease: false
+          files: |
+            artifacts/release-notes-pls-linux-amd64/release-notes-pls-linux-amd64
+            artifacts/release-notes-pls-darwin-amd64/release-notes-pls-darwin-amd64
+            artifacts/release-notes-pls-darwin-arm64/release-notes-pls-darwin-arm64
+            artifacts/release-notes-pls-windows-amd64/release-notes-pls-windows-amd64.exe

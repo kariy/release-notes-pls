@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# PyInstaller
+*.spec.log
+*.manifest
+*.pyz
+*.pkg
+
+# OS specific
+.DS_Store
+Thumbs.db
