@@ -31,12 +31,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate AI-powered release notes.")
     parser.add_argument("--base", required=True, help="Base tag.")
     parser.add_argument("--head", required=True, help="Head tag.")
+    parser.add_argument("--output", help="Path to file where release notes will be saved. If not provided, prints to stdout.")
     parser.add_argument("repo", help="GitHub repository name (owner/repo).")
     args = parser.parse_args()
 
     repo = args.repo
     base = args.base
     head = args.head
+    output_file = args.output
     github_token = os.environ.get("GITHUB_TOKEN")
     api_key = os.environ.get("API_KEY")
 
@@ -88,5 +90,12 @@ if __name__ == "__main__":
         messages=[{"role": "user", "content": prompt}],
     )
 
+    output_text = ""
     for text in message.content:
-        print(text.text)
+        output_text += text.text
+
+    if output_file:
+        with open(output_file, "w") as f:
+            f.write(output_text)
+    else:
+        print(output_text)
