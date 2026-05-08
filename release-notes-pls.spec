@@ -4,7 +4,6 @@ import platform
 
 # Platform-specific hidden imports
 hiddenimports_base = [
-    'anthropic',
     'openai',
     'github',
     'pygithub',

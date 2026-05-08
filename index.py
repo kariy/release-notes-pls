@@ -1,101 +1,393 @@
-import os
 import argparse
+import os
+import re
 import sys
+
 from github import Auth, Github
-import anthropic
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"
 
 
-def generate_prompt(formatted_changes):
-    prompt = f"""
-	You are an expert technical writer for a software project. Your task is to generate clear, concise, and user-friendly release notes based on the following list of changes (Pull Request descriptions and commit messages).
-
-	Here are the changes: {formatted_changes}
-
-	Generate the notes in this exact format in Markdown:
-
-	```
-	## <CHANGE CATEGORY>
-
-	* <CHANGE_SUMMARY> (<PR_NUMBER>)
-	```
-
-	Valid change categories are: fixes, improvements
-
-	If there are multiple PRs associated with a change, list the PR using the format `(<PR_NUMBER>)` side by side.
-	"""
-
-    return prompt
+SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+CONVENTIONAL_PREFIX = re.compile(r"^([a-z]+)(?:\(([^)]+)\))?(!)?:")
+PR_REF_IN_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
+SKIPPABLE_PREFIXES = ("chore(release):", "release(prepare):")
 
 
-if __name__ == "__main__":
+class Bullet(BaseModel):
+    text: str = Field(
+        description="User-visible behavior change in plain language. Present-tense imperative ('Add X', 'Fix Y'). No leading dash, no PR number suffix."
+    )
+    prs: list[int] = Field(
+        default_factory=list,
+        description="PR numbers associated with this user-visible change. May be empty if the underlying commit has no associated PR (e.g., direct push, or a squash-merge GitHub did not link back). One or more if multiple PRs contribute to the same change.",
+    )
+
+
+class CuratedNotes(BaseModel):
+    summary: str = Field(
+        description="1-2 sentence opening summary describing the character of this release. Tone matches release type."
+    )
+    breaking_changes: list[Bullet] = Field(default_factory=list)
+    features: list[Bullet] = Field(default_factory=list)
+    fixes: list[Bullet] = Field(default_factory=list)
+    performance: list[Bullet] = Field(default_factory=list)
+
+
+def resolve_base(base: str, repo) -> str:
+    if base != "auto":
+        return base
+    for release in repo.get_releases():
+        if release.draft or release.prerelease:
+            continue
+        if SEMVER_TAG.match(release.tag_name or ""):
+            return release.tag_name
+    raise SystemExit("Error: could not auto-detect previous release tag. Pass --base explicitly.")
+
+
+def infer_release_type(commits) -> str:
+    has_breaking = False
+    has_feat = False
+    for commit in commits:
+        message = commit.commit.message
+        subject = message.splitlines()[0] if message else ""
+        if "BREAKING CHANGE:" in message:
+            has_breaking = True
+        match = CONVENTIONAL_PREFIX.match(subject)
+        if match:
+            type_, _scope, bang = match.groups()
+            if bang:
+                has_breaking = True
+            if type_ == "feat":
+                has_feat = True
+    if has_breaking:
+        return "major"
+    if has_feat:
+        return "minor"
+    return "patch"
+
+
+def is_changelog_worthy(commit) -> bool:
+    subject = commit.commit.message.splitlines()[0]
+    if subject.startswith(("Merge pull request", "Merge branch", "Merge remote-tracking branch")):
+        return False
+    if subject.startswith(SKIPPABLE_PREFIXES):
+        return False
+    return True
+
+
+def commit_subject_with_pr(commit) -> str:
+    subject = commit.commit.message.splitlines()[0]
+    if PR_REF_IN_SUBJECT.search(subject):
+        return subject
+    prs = list(commit.get_pulls())
+    if prs:
+        return f"{subject} (#{prs[0].number})"
+    return subject
+
+
+def collect_pr_changes(commits) -> dict:
+    changes = {}
+    for commit in commits:
+        for pr in commit.get_pulls():
+            entry = changes.setdefault(pr.number, {"pr": pr, "commits": []})
+            entry["commits"].append(commit.commit)
+    return changes
+
+
+def format_changes_for_prompt(commits, changes: dict) -> str:
+    parts = []
+    seen_shas = set()
+    for change in changes.values():
+        pr = change["pr"]
+        parts.append(f"\n--- PR #{pr.number} ---")
+        parts.append(f"Title: {pr.title}")
+        if pr.body:
+            parts.append(f"Description:\n{pr.body}")
+        parts.append("Commits:")
+        for commit in change["commits"]:
+            parts.append(f"- {commit.message.splitlines()[0]}")
+            seen_shas.add(commit.sha)
+
+    orphans = [
+        c for c in commits
+        if c.sha not in seen_shas and is_changelog_worthy(c)
+    ]
+    if orphans:
+        parts.append("\n--- Direct commits (no associated PR found) ---")
+        parts.append("These commits did not match any PR via the GitHub API. If their conventional-commit prefix (feat/fix/perf) implies a curated bullet, include them with an empty prs list.")
+        for commit in orphans:
+            parts.append(f"- {commit.commit.message.splitlines()[0]}")
+    return "\n".join(parts)
+
+
+SUMMARY_HINTS = {
+    "patch": (
+        '"This release brings stability improvements and a set of important bug fixes." '
+        'or "This release addresses a critical bug in <area>."'
+    ),
+    "minor": '"This release introduces <theme>, alongside several improvements and fixes."',
+    "major": '"This is a major release that <high-level shift>. See Breaking Changes below before upgrading."',
+}
+
+
+def generate_curated_notes(client, project: str, release_type: str, changes_text: str) -> CuratedNotes:
+    prompt = f"""You are an expert technical writer producing release notes for {project}.
+
+The release is a {release_type} release based on its commit history.
+
+Below are the pull requests merged since the previous release. For each PR you have its title, description, and the commits associated with it.
+
+{changes_text}
+
+Produce structured release notes:
+
+1. summary: 1-2 sentence opening that describes the character of this release. Match the tone to a {release_type} release. Examples: {SUMMARY_HINTS[release_type]}
+
+2. Categorize user-visible changes into the four buckets:
+   - breaking_changes: Anything that requires users to change setup, configuration, or code
+   - features: New user-facing capabilities (typically feat: commits)
+   - fixes: Bug fixes that affect user-visible behavior (typically fix: commits)
+   - performance: Performance improvements (typically perf: commits)
+
+Rules for bullets:
+- Use present-tense imperative ('Add X', 'Fix Y', 'Improve Z'). No leading dash. No PR number suffix.
+- Describe each change in plain user-facing language. Do NOT regurgitate commit messages.
+- Group multiple PRs that contribute to the same user-visible change into ONE bullet with all PR numbers.
+
+REQUIRED inclusions - every commit whose subject starts with one of these conventional-commit prefixes MUST appear as a bullet in the matching curated section, even if it looks narrow, dev-only, or like internal tooling. The maintainer used the prefix to signal user-visibility; honor that signal and do not second-guess it:
+- `feat:` or `feat(<scope>):` -> Features
+- `fix:` or `fix(<scope>):` -> Fixes
+- `perf:` or `perf(<scope>):` -> Performance
+- Any `!:` after the type, or a `BREAKING CHANGE:` footer in the body -> Breaking Changes (in addition to its base category)
+
+If you find yourself wanting to skip a `feat:` / `fix:` / `perf:` commit because it seems too small or too internal, DON'T - include it. A short bullet describing what was added/fixed is fine.
+
+SKIP entirely (these belong only in the Full Changelog, which is assembled separately): `refactor:`, `docs:`, `ci:`, `test:`, `chore:`, `style:`, `build:`, dependency bumps, and `Revert` commits.
+
+If a curated category has no matching commits, return an empty list for it.
+"""
+
+    response = client.beta.chat.completions.parse(
+        model=DEFAULT_MODEL,
+        max_tokens=16000,
+        messages=[{"role": "user", "content": prompt}],
+        response_format=CuratedNotes,
+    )
+    parsed = response.choices[0].message.parsed
+    if parsed is None:
+        raise SystemExit("Error: model did not return a parseable response.")
+    return parsed
+
+
+def render_section(name: str, bullets: list[Bullet]) -> str:
+    lines = [f"## {name}", ""]
+    for bullet in bullets:
+        pr_refs = " ".join(f"(#{n})" for n in sorted(bullet.prs))
+        lines.append(f"- {bullet.text} {pr_refs}".rstrip())
+    return "\n".join(lines)
+
+
+def render_full_changelog(commits) -> str:
+    lines = ["## Full Changelog", ""]
+    for commit in commits:
+        if not is_changelog_worthy(commit):
+            continue
+        lines.append(f"* {commit_subject_with_pr(commit)}")
+    return "\n".join(lines)
+
+
+def assemble_notes(
+    *,
+    project: str,
+    head: str,
+    base: str,
+    repo_url: str,
+    curated: CuratedNotes,
+    commits,
+) -> str:
+    blocks = [f"# {project} {head} Release Notes", curated.summary]
+    if curated.breaking_changes:
+        blocks.append(render_section("Breaking Changes", curated.breaking_changes))
+    if curated.features:
+        blocks.append(render_section("Features", curated.features))
+    if curated.fixes:
+        blocks.append(render_section("Fixes", curated.fixes))
+    if curated.performance:
+        blocks.append(render_section("Performance", curated.performance))
+    blocks.append(render_full_changelog(commits))
+    blocks.append(f"**Full diff:** {repo_url}/compare/{base}...{head}")
+    return "\n\n".join(blocks) + "\n"
+
+
+ALLOWED_SECTIONS = ("Breaking Changes", "Features", "Fixes", "Performance", "Full Changelog")
+SECTION_ORDER = {name: i for i, name in enumerate(ALLOWED_SECTIONS)}
+
+TITLE_RE = re.compile(r"^# .+ Release Notes$")
+SECTION_HEADER_RE = re.compile(r"^## (.+)$")
+CURATED_BULLET_RE = re.compile(r"^- \S.*$")
+CHANGELOG_BULLET_RE = re.compile(r"^\* .+$")
+DIFF_LINK_RE = re.compile(
+    r"^\*\*Full diff:\*\* https://github\.com/[^/\s]+/[^/\s]+/compare/\S+\.\.\.\S+$"
+)
+
+
+def validate(text: str) -> list[str]:
+    """Return a list of validation error messages. Empty list means valid."""
+    errors: list[str] = []
+
+    if not text.endswith("\n"):
+        errors.append("document must end with a trailing newline")
+
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+
+    if len(lines) < 7:
+        errors.append(f"document too short ({len(lines)} lines, expected at least 7)")
+        return errors
+
+    if not TITLE_RE.match(lines[0]):
+        errors.append(f"line 1: title must match '# <project> <version> Release Notes', got: {lines[0]!r}")
+    if lines[1] != "":
+        errors.append(f"line 2: expected blank line after title, got: {lines[1]!r}")
+    if not lines[2].strip():
+        errors.append("line 3: summary line is blank")
+    if lines[3] != "":
+        errors.append(f"line 4: expected blank line after summary, got: {lines[3]!r}")
+
+    section_starts: list[tuple[int, str]] = []
+    diff_link_found = False
+    for i, line in enumerate(lines):
+        m = SECTION_HEADER_RE.match(line)
+        if m:
+            section_starts.append((i, m.group(1)))
+        elif DIFF_LINK_RE.match(line):
+            diff_link_found = True
+
+    if not diff_link_found:
+        errors.append("missing or malformed '**Full diff:** https://github.com/<owner>/<repo>/compare/<base>...<head>' line")
+
+    last_idx = -1
+    for line_idx, name in section_starts:
+        if name not in SECTION_ORDER:
+            errors.append(
+                f"line {line_idx+1}: unknown section '{name}' (allowed: {', '.join(ALLOWED_SECTIONS)})"
+            )
+            continue
+        idx = SECTION_ORDER[name]
+        if idx <= last_idx:
+            errors.append(
+                f"line {line_idx+1}: section '{name}' is out of order "
+                f"(expected: {' -> '.join(ALLOWED_SECTIONS)})"
+            )
+        last_idx = idx
+
+    if not any(name == "Full Changelog" for _, name in section_starts):
+        errors.append("missing required section '## Full Changelog'")
+
+    for idx, (start_line, name) in enumerate(section_starts):
+        next_start = section_starts[idx + 1][0] if idx + 1 < len(section_starts) else len(lines)
+        body = lines[start_line + 1 : next_start]
+        if not body or body[0] != "":
+            errors.append(f"line {start_line+2}: expected blank line after '## {name}'")
+        bullet_re = CHANGELOG_BULLET_RE if name == "Full Changelog" else CURATED_BULLET_RE
+        bullet_count = 0
+        for offset, line in enumerate(body[1:], start=2):
+            if line == "":
+                continue
+            if DIFF_LINK_RE.match(line):
+                continue
+            if not bullet_re.match(line):
+                expected = "* <subject>" if name == "Full Changelog" else "- <text> [optional (#NNN) refs]"
+                errors.append(
+                    f"line {start_line+offset}: '{name}' bullet doesn't match '{expected}', got: {line!r}"
+                )
+            else:
+                bullet_count += 1
+        if bullet_count == 0:
+            errors.append(f"section '## {name}' has no bullets")
+
+    return errors
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Generate AI-powered release notes.")
-    parser.add_argument("--base", required=True, help="Base tag.")
-    parser.add_argument("--head", required=True, help="Head tag.")
-    parser.add_argument("--output", help="Path to file where release notes will be saved. If not provided, prints to stdout.")
-    parser.add_argument("repo", help="GitHub repository name (owner/repo).")
+    parser.add_argument(
+        "--base",
+        required=True,
+        help="Previous release tag (e.g. v1.6.1), or 'auto' to detect the latest published release.",
+    )
+    parser.add_argument(
+        "--head",
+        required=True,
+        help="New release tag or commit SHA to compare against.",
+    )
+    parser.add_argument(
+        "--project-name",
+        help="Project name shown in the title. Defaults to the GitHub repo name.",
+    )
+    parser.add_argument(
+        "--output",
+        help="Path to write the release notes to. Prints to stdout if omitted.",
+    )
+    parser.add_argument("repo", help="GitHub repository (owner/repo).")
     args = parser.parse_args()
 
-    repo = args.repo
-    base = args.base
-    head = args.head
-    output_file = args.output
     github_token = os.environ.get("GITHUB_TOKEN")
-    api_key = os.environ.get("API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
 
     if not github_token:
         print("Error: GITHUB_TOKEN environment variable must be set.", file=sys.stderr)
         sys.exit(1)
 
     if not api_key:
-        print("Error: API_KEY environment variable must be set.", file=sys.stderr)
+        print("Error: OPENROUTER_API_KEY environment variable must be set.", file=sys.stderr)
         sys.exit(1)
 
-    auth = Auth.Token(github_token)
-    client = Github(auth=auth)
+    gh = Github(auth=Auth.Token(github_token))
+    repo = gh.get_repo(args.repo)
 
-    repo = client.get_repo(repo)
-    commits = repo.compare(base, head).complete().commits
+    base = resolve_base(args.base, repo)
+    head = args.head
+    project = args.project_name or repo.name
 
-    # (pr, commit)
-    changes = {}
+    commits = list(repo.compare(base, head).complete().commits)
+    if not commits:
+        raise SystemExit(f"Error: no commits found between {base} and {head}.")
 
-    for commit in commits:
-        prs = commit.get_pulls()
-        for pr in prs:
-            id = pr.number
-            changes[id] = {"pr": pr, "commits": []}
-            changes[id]["commits"].append(commit.commit)
+    release_type = infer_release_type(commits)
+    changes = collect_pr_changes(commits)
+    changes_text = format_changes_for_prompt(commits, changes)
 
-    # Convert the structured changes into a string format for the AI prompt.
-    formatted_changes = ""
-    for change in changes.values():
-        pr = change["pr"]
-        commits = change["commits"]
+    client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    curated = generate_curated_notes(client, project, release_type, changes_text)
 
-        formatted_changes += f"\n--- PR #{pr.number} ---\n"
-        formatted_changes += f"## Title\n{pr.title}\n"
-        formatted_changes += f"## Description\n{pr.body}\n"
-        formatted_changes += "## Commits:\n"
-
-        for commit in commits:
-            formatted_changes += f"- {commit.message.splitlines()[0]}"
-            formatted_changes += "\n"
-
-    prompt = generate_prompt(formatted_changes)
-
-    client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model="claude-4-sonnet-20250514",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
+    output = assemble_notes(
+        project=project,
+        head=head,
+        base=base,
+        repo_url=repo.html_url,
+        curated=curated,
+        commits=commits,
     )
 
-    output_text = ""
-    for text in message.content:
-        output_text += text.text
-
-    if output_file:
-        with open(output_file, "w") as f:
-            f.write(output_text)
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(output)
     else:
-        print(output_text)
+        print(output)
+
+    errors = validate(output)
+    if errors:
+        print("Generated release notes failed validation:", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

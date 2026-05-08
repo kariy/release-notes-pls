@@ -121,7 +121,7 @@ jobs:
           Set the required environment variables:
           \`\`\`bash
           export GITHUB_TOKEN="your-github-token"
-          export API_KEY="your-anthropic-api-key"
+          export OPENROUTER_API_KEY="your-openrouter-api-key"
           \`\`\`
 
           Generate release notes:
