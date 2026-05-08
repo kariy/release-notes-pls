@@ -21,9 +21,6 @@ jobs:
             artifact_name: release-notes-pls-linux-amd64
             binary_name: release-notes-pls
           - os: macos-latest
-            artifact_name: release-notes-pls-darwin-amd64
-            binary_name: release-notes-pls
-          - os: macos-13
             artifact_name: release-notes-pls-darwin-arm64
             binary_name: release-notes-pls
           - os: windows-latest
@@ -107,7 +104,6 @@ jobs:
           Download the appropriate binary for your platform:
 
           - **Linux (x86_64)**: \`release-notes-pls-linux-amd64\`
-          - **macOS (Intel)**: \`release-notes-pls-darwin-amd64\`
           - **macOS (Apple Silicon)**: \`release-notes-pls-darwin-arm64\`
           - **Windows**: \`release-notes-pls-windows-amd64.exe\`
 
@@ -145,6 +141,5 @@ jobs:
           prerelease: false
           files: |
             artifacts/release-notes-pls-linux-amd64/release-notes-pls-linux-amd64
-            artifacts/release-notes-pls-darwin-amd64/release-notes-pls-darwin-amd64
             artifacts/release-notes-pls-darwin-arm64/release-notes-pls-darwin-arm64
             artifacts/release-notes-pls-windows-amd64/release-notes-pls-windows-amd64.exe
