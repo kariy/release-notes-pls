@@ -23,7 +23,7 @@ CACHE_DIR = Path.home() / ".cache" / "release-notes-pls"
 SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 CONVENTIONAL_PREFIX = re.compile(r"^([a-z]+)(?:\(([^)]+)\))?(!)?:")
 PR_REF_IN_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
-SKIPPABLE_PREFIXES = ("chore(release):", "release(prepare):")
+SKIPPABLE_PREFIXES = ("chore(release):", "release(prepare):", "release: ")
 
 
 class Bullet(BaseModel):
