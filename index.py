@@ -1,7 +1,11 @@
 import argparse
+import concurrent.futures
 import os
 import re
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 from github import Auth, Github
 from openai import OpenAI
@@ -9,6 +13,11 @@ from pydantic import BaseModel, Field
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"
+
+PI_MODEL = "anthropic/claude-sonnet-4.5"
+PI_TIMEOUT_SEC = 300
+PI_MAX_PARALLEL = 2
+CACHE_DIR = Path.home() / ".cache" / "release-notes-pls"
 
 
 SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
@@ -98,9 +107,17 @@ def collect_pr_changes(commits) -> dict:
     return changes
 
 
-def format_changes_for_prompt(commits, changes: dict) -> str:
+def get_orphan_commits(commits, changes: dict) -> list:
+    seen = {c.sha for change in changes.values() for c in change["commits"]}
+    return [c for c in commits if c.sha not in seen and is_changelog_worthy(c)]
+
+
+def format_changes_for_prompt(
+    commits,
+    changes: dict,
+    pi_summaries: dict | None = None,
+) -> str:
     parts = []
-    seen_shas = set()
     for change in changes.values():
         pr = change["pr"]
         parts.append(f"\n--- PR #{pr.number} ---")
@@ -110,17 +127,17 @@ def format_changes_for_prompt(commits, changes: dict) -> str:
         parts.append("Commits:")
         for commit in change["commits"]:
             parts.append(f"- {commit.message.splitlines()[0]}")
-            seen_shas.add(commit.sha)
+        if pi_summaries and pr.number in pi_summaries:
+            parts.append(f"Pi exploration summary:\n{pi_summaries[pr.number]}")
 
-    orphans = [
-        c for c in commits
-        if c.sha not in seen_shas and is_changelog_worthy(c)
-    ]
+    orphans = get_orphan_commits(commits, changes)
     if orphans:
         parts.append("\n--- Direct commits (no associated PR found) ---")
         parts.append("These commits did not match any PR via the GitHub API. If their conventional-commit prefix (feat/fix/perf) implies a curated bullet, include them with an empty prs list.")
         for commit in orphans:
             parts.append(f"- {commit.commit.message.splitlines()[0]}")
+            if pi_summaries and commit.sha in pi_summaries:
+                parts.append(f"Pi exploration summary:\n{pi_summaries[commit.sha]}")
     return "\n".join(parts)
 
 
@@ -139,7 +156,7 @@ def generate_curated_notes(client, project: str, release_type: str, changes_text
 
 The release is a {release_type} release based on its commit history.
 
-Below are the pull requests merged since the previous release. For each PR you have its title, description, and the commits associated with it.
+Below are the pull requests merged since the previous release. For each PR you have its title, description, and the commits associated with it. Some PRs and orphan commits also include a "Pi exploration summary" section: this is a deeper analysis of the actual diff and surrounding code produced by a separate agent. When present, lean on it heavily to write user-facing bullets - it is the most accurate description of user-visible impact.
 
 {changes_text}
 
@@ -314,6 +331,167 @@ def validate(text: str) -> list[str]:
     return errors
 
 
+def check_pi_installed() -> None:
+    if shutil.which("pi") is None:
+        raise SystemExit(
+            "Error: 'pi' CLI not found on PATH. Install via:\n"
+            "  npm install -g @earendil-works/pi-coding-agent\n"
+            "or:\n"
+            "  curl -fsSL https://pi.dev/install.sh | sh"
+        )
+
+
+def ensure_local_clone(repo_full: str, head_ref: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    repo_dir = CACHE_DIR / repo_full.replace("/", "__")
+    if not (repo_dir / ".git").exists():
+        print(f"Cloning {repo_full} to {repo_dir} (first time, may take a while)...", file=sys.stderr)
+        subprocess.run(
+            ["git", "clone", f"https://github.com/{repo_full}.git", str(repo_dir)],
+            check=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "fetch", "--all", "--tags", "--quiet"],
+            check=True,
+        )
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "checkout", "--quiet", "--force", head_ref],
+        check=True,
+    )
+    return repo_dir
+
+
+def use_existing_repo(repo_dir_arg: str) -> Path:
+    repo_dir = Path(repo_dir_arg).expanduser().resolve()
+    if not (repo_dir / ".git").exists():
+        raise SystemExit(f"Error: --repo-dir {repo_dir} is not a git repository.")
+    return repo_dir
+
+
+PI_PROMPT_TEMPLATE = """You are exploring a git repository to understand the user-visible impact of a discrete change in an upcoming release.
+
+The change is grouped under {unit_label}.
+
+{pr_context}
+
+Commits in this unit:
+{commit_list}
+
+Your task:
+1. Run `git show <sha>` (or `git show --stat <sha>` for large diffs) on each commit to see the actual diff. Use `git log --oneline` if you need to navigate.
+2. If the diff references symbols or files whose purpose is unclear, read them with the `read` tool to understand them.
+3. Output a 2-4 sentence summary of the user-visible impact, in plain language.
+
+Constraints:
+- Do not restate commit messages verbatim.
+- Focus on what end users (or API/CLI consumers) can observe: new behavior, changed APIs, fixed bugs, performance.
+- If the change is purely internal (refactor, test scaffolding, CI), say so concisely in one sentence.
+- Do not modify any files.
+
+Output the summary as plain prose. No preamble, no markdown headings.
+"""
+
+
+def explore_unit_with_pi(
+    *,
+    repo_dir: Path,
+    unit_label: str,
+    pr_context: str,
+    commit_list: str,
+    openrouter_key: str,
+) -> str:
+    prompt = PI_PROMPT_TEMPLATE.format(
+        unit_label=unit_label,
+        pr_context=pr_context,
+        commit_list=commit_list,
+    )
+    cmd = [
+        "pi", "-p",
+        "--no-session",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--tools", "read,bash,grep,find,ls",
+        "--provider", "openrouter",
+        "--model", PI_MODEL,
+        prompt,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_dir),
+            env={**os.environ, "OPENROUTER_API_KEY": openrouter_key},
+            timeout=PI_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return f"(pi exploration timed out after {PI_TIMEOUT_SEC}s)"
+    if result.returncode != 0:
+        return f"(pi exploration failed: {result.stderr.strip()[:200]})"
+    return result.stdout.strip() or "(pi returned empty output)"
+
+
+def run_pi_explorations(
+    *,
+    repo_dir: Path,
+    changes: dict,
+    orphans: list,
+    openrouter_key: str,
+) -> dict:
+    """Returns a dict keyed by PR number (int) for PR units and commit SHA (str) for orphans."""
+    units: list[dict] = []
+    for pr_number, change in changes.items():
+        pr = change["pr"]
+        commit_list = "\n".join(
+            f"- {c.sha[:8]}: {c.message.splitlines()[0]}" for c in change["commits"]
+        )
+        pr_context = f"PR #{pr.number}: {pr.title}"
+        if pr.body:
+            pr_context += f"\n\n{pr.body}"
+        units.append({
+            "key": pr.number,
+            "unit_label": f"PR #{pr.number}",
+            "pr_context": pr_context,
+            "commit_list": commit_list,
+        })
+    for commit in orphans:
+        sha = commit.sha
+        units.append({
+            "key": sha,
+            "unit_label": f"a direct commit ({sha[:8]})",
+            "pr_context": "(no PR description available)",
+            "commit_list": f"- {sha[:8]}: {commit.commit.message.splitlines()[0]}",
+        })
+
+    if not units:
+        return {}
+
+    summaries: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PI_MAX_PARALLEL) as exe:
+        futures = {
+            exe.submit(
+                explore_unit_with_pi,
+                repo_dir=repo_dir,
+                unit_label=u["unit_label"],
+                pr_context=u["pr_context"],
+                commit_list=u["commit_list"],
+                openrouter_key=openrouter_key,
+            ): u["key"]
+            for u in units
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            key = futures[fut]
+            try:
+                summaries[key] = fut.result()
+            except Exception as e:
+                summaries[key] = f"(pi exploration error: {e})"
+    return summaries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate AI-powered release notes.")
     parser.add_argument(
@@ -333,6 +511,15 @@ def main() -> None:
     parser.add_argument(
         "--output",
         help="Path to write the release notes to. Prints to stdout if omitted.",
+    )
+    parser.add_argument(
+        "--explore",
+        action="store_true",
+        help="Run the 'pi' coding agent over each PR (and orphan commit) before summarizing, so the LLM has deeper context than commit messages alone. Requires 'pi' on PATH; clones the repo to ~/.cache/release-notes-pls (override with --repo-dir).",
+    )
+    parser.add_argument(
+        "--repo-dir",
+        help="Path to an existing local clone of the target repo. Used only with --explore; skips the cache clone and fetch. Working tree is left untouched - pi reads commits via 'git show' rather than checking out.",
     )
     parser.add_argument("repo", help="GitHub repository (owner/repo).")
     args = parser.parse_args()
@@ -361,7 +548,27 @@ def main() -> None:
 
     release_type = infer_release_type(commits)
     changes = collect_pr_changes(commits)
-    changes_text = format_changes_for_prompt(commits, changes)
+
+    pi_summaries: dict | None = None
+    if args.explore:
+        check_pi_installed()
+        if args.repo_dir:
+            repo_dir = use_existing_repo(args.repo_dir)
+        else:
+            repo_dir = ensure_local_clone(args.repo, head)
+        orphans = get_orphan_commits(commits, changes)
+        print(
+            f"Running pi exploration on {len(changes)} PR(s) and {len(orphans)} orphan commit(s)...",
+            file=sys.stderr,
+        )
+        pi_summaries = run_pi_explorations(
+            repo_dir=repo_dir,
+            changes=changes,
+            orphans=orphans,
+            openrouter_key=api_key,
+        )
+
+    changes_text = format_changes_for_prompt(commits, changes, pi_summaries)
 
     client = OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
     curated = generate_curated_notes(client, project, release_type, changes_text)

@@ -29,6 +29,7 @@ Uses `anthropic/claude-sonnet-4.5` via [OpenRouter](https://openrouter.ai) by de
 | `--head`         | New release tag or commit SHA to compare against.                              |
 | `--project-name` | Project name in the title. Defaults to the GitHub repo name.                   |
 | `--output`       | Path to write the notes to. Prints to stdout if omitted.                       |
+| `--explore`      | Run the [`pi`](https://github.com/earendil-works/pi) coding agent over each PR (and orphan commit) so the LLM has deeper context than commit messages alone. Clones the repo to `~/.cache/release-notes-pls` (re-fetched on subsequent runs). Requires `pi` on PATH (`npm install -g @earendil-works/pi-coding-agent`). |
 | `repo`           | GitHub repository, as `owner/repo`.                                            |
 
 ### Examples
