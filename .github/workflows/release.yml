@@ -76,6 +76,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so 'git describe' can find the previous tag
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -93,42 +95,70 @@ jobs:
             echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate release notes
-        id: release_notes
+      - name: Find previous tag
+        id: prev_tag
         run: |
-          cat << EOF > release_notes.md
-          ## Release ${{ steps.get_version.outputs.VERSION }}
+          TAG="${{ steps.get_version.outputs.TAG_NAME }}"
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          echo "PREV_TAG=$PREV" >> $GITHUB_OUTPUT
+          echo "Previous tag: ${PREV:-(none, first release)}"
 
+      - name: Generate AI release notes
+        id: ai_notes
+        if: steps.prev_tag.outputs.PREV_TAG != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          BIN="./artifacts/release-notes-pls-linux-amd64/release-notes-pls-linux-amd64"
+          chmod +x "$BIN"
+          "$BIN" \
+            --base "${{ steps.prev_tag.outputs.PREV_TAG }}" \
+            --head "${{ steps.get_version.outputs.TAG_NAME }}" \
+            --project-name release-notes-pls \
+            --output ai-notes.md \
+            kariy/release-notes-pls
+
+      - name: Compose release body
+        run: |
+          if [ -f ai-notes.md ]; then
+            cat ai-notes.md > release_notes.md
+            printf '\n---\n\n' >> release_notes.md
+          else
+            printf '## Release %s\n\n' "${{ steps.get_version.outputs.VERSION }}" > release_notes.md
+          fi
+          cat << 'EOF' >> release_notes.md
           ### Installation
 
           Download the appropriate binary for your platform:
 
-          - **Linux (x86_64)**: \`release-notes-pls-linux-amd64\`
-          - **macOS (Apple Silicon)**: \`release-notes-pls-darwin-arm64\`
-          - **Windows**: \`release-notes-pls-windows-amd64.exe\`
+          - **Linux (x86_64)**: `release-notes-pls-linux-amd64`
+          - **macOS (Apple Silicon)**: `release-notes-pls-darwin-arm64`
+          - **Windows**: `release-notes-pls-windows-amd64.exe`
 
           Make the binary executable (Linux/macOS):
-          \`\`\`bash
+          ```bash
           chmod +x release-notes-pls-*
-          \`\`\`
+          ```
 
           ### Usage
 
           Set the required environment variables:
-          \`\`\`bash
+          ```bash
           export GITHUB_TOKEN="your-github-token"
           export OPENROUTER_API_KEY="your-openrouter-api-key"
-          \`\`\`
+          ```
 
           Generate release notes:
-          \`\`\`bash
+          ```bash
           ./release-notes-pls --base v1.0.0 --head v1.1.0 owner/repo
-          \`\`\`
+          ```
 
           For more options:
-          \`\`\`bash
+          ```bash
           ./release-notes-pls --help
-          \`\`\`
+          ```
           EOF
 
       - name: Create Release
